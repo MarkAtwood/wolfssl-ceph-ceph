@@ -20,12 +20,6 @@
 
 #include <openssl/evp.h>
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-
 namespace TOPNSPC::crypto::ssl {
 
 void zeroize_for_security(void* const s, const size_t n) {
@@ -56,17 +50,11 @@ ssl::OpenSSLDigest::OpenSSLDigest(const EVP_MD * _type)
 
 ssl::OpenSSLDigest::~OpenSSLDigest() {
   EVP_MD_CTX_destroy(mpContext);
-  if (mpType_FIPS) {
-#if OPENSSL_VERSION_NUMBER >= 0x30000000L
-    EVP_MD_free(mpType_FIPS);
-#endif  // OPENSSL_VERSION_NUMBER >= 0x30000000L
-  }
 }
 
 ssl::OpenSSLDigest::OpenSSLDigest(OpenSSLDigest&& o) noexcept
   : mpContext(std::exchange(o.mpContext, nullptr)),
-    mpType(std::exchange(o.mpType, nullptr)),
-    mpType_FIPS(std::exchange(o.mpType_FIPS, nullptr))
+    mpType(std::exchange(o.mpType, nullptr))
 {
 }
 
@@ -74,16 +62,11 @@ ssl::OpenSSLDigest& ssl::OpenSSLDigest::operator=(OpenSSLDigest&& o) noexcept
 {
   std::swap(mpContext, o.mpContext);
   std::swap(mpType, o.mpType);
-  std::swap(mpType_FIPS, o.mpType_FIPS);
   return *this;
 }
 
 void ssl::OpenSSLDigest::Restart() {
-  if (mpType_FIPS) {
-    EVP_DigestInit_ex(mpContext, mpType_FIPS, NULL);
-  } else {
-    EVP_DigestInit_ex(mpContext, mpType, NULL);
-  }
+  EVP_DigestInit_ex(mpContext, mpType, NULL);
 }
 
 const EVP_MD *ssl::MD5NonCrypto::digest_type() {
@@ -107,17 +90,6 @@ const EVP_MD *ssl::MD5NonCrypto::digest_type() {
 #endif
 }
 
-void ssl::OpenSSLDigest::SetFlags(int flags) {
-  if (flags == EVP_MD_CTX_FLAG_NON_FIPS_ALLOW && OpenSSL_version_num() >= 0x30000000L && mpType == EVP_md5() && !mpType_FIPS) {
-#if OPENSSL_VERSION_NUMBER >= 0x30000000L
-    mpType_FIPS = EVP_MD_fetch(NULL, "MD5", "fips=no");
-#endif  // OPENSSL_VERSION_NUMBER >= 0x30000000L
-  } else {
-    EVP_MD_CTX_set_flags(mpContext, flags);
-  }
-  this->Restart();
-}
-
 void ssl::OpenSSLDigest::Update(const unsigned char *input, size_t length) {
   if (length) {
     EVP_DigestUpdate(mpContext, const_cast<void *>(reinterpret_cast<const void *>(input)), length);
@@ -130,6 +102,3 @@ void ssl::OpenSSLDigest::Final(unsigned char *digest) {
 }
 
 }
-
-#pragma clang diagnostic pop
-#pragma GCC diagnostic pop

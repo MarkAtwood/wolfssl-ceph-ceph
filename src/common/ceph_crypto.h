@@ -28,12 +28,6 @@
 
 #include "include/ceph_assert.h"
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-
 extern "C" {
   const EVP_MD *EVP_md5(void);
   const EVP_MD *EVP_sha1(void);
@@ -60,14 +54,12 @@ namespace TOPNSPC::crypto {
       private:
 	EVP_MD_CTX *mpContext;
 	const EVP_MD *mpType;
-        EVP_MD *mpType_FIPS = nullptr;
       public:
 	OpenSSLDigest (const EVP_MD *_type);
 	~OpenSSLDigest ();
 	OpenSSLDigest(OpenSSLDigest&& o) noexcept;
 	OpenSSLDigest& operator=(OpenSSLDigest&& o) noexcept;
 	void Restart();
-	void SetFlags(int flags);
 	void Update (const unsigned char *input, size_t length);
 	void Final (unsigned char *digest);
     };
@@ -311,8 +303,5 @@ auto digest(const ceph::buffer::list& bl)
   return sha_digest_t<Digest::digest_size>{fingerprint};
 }
 }
-
-#pragma clang diagnostic pop
-#pragma GCC diagnostic pop
 
 #endif
