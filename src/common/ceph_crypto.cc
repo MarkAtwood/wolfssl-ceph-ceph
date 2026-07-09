@@ -86,6 +86,27 @@ void ssl::OpenSSLDigest::Restart() {
   }
 }
 
+const EVP_MD *ssl::MD5NonCrypto::digest_type() {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+  // An explicit "fips=no" query term overrides the same term in the
+  // default property query, and matches the default provider's MD5
+  // (which does not define the "fips" property at all).
+  // Process-lifetime cache, deliberately never freed -- same policy as
+  // HMAC::get_evp_mac() in ceph_crypto.h.
+  static const EVP_MD * const md = []() -> const EVP_MD * {
+    if (EVP_MD * const fetched = EVP_MD_fetch(nullptr, "MD5", "fips=no")) {
+      return fetched;
+    }
+    return EVP_md5();  // no provider offers non-FIPS MD5; legacy fallback
+  }();
+  return md;
+#else
+  // Pre-3.0: EVP_MD_CTX_FLAG_NON_FIPS_ALLOW was already a no-op outside
+  // the ancient 1.0.x FIPS module, so plain MD5 is behavior-identical.
+  return EVP_md5();
+#endif
+}
+
 void ssl::OpenSSLDigest::SetFlags(int flags) {
   if (flags == EVP_MD_CTX_FLAG_NON_FIPS_ALLOW && OpenSSL_version_num() >= 0x30000000L && mpType == EVP_md5() && !mpType_FIPS) {
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
