@@ -822,6 +822,21 @@ options:
   flags:
   - startup
   with_legacy: true
+- name: openssl_provider_opts
+  type: str
+  level: advanced
+  desc: Load OpenSSL 3 providers at radosgw startup
+  long_desc: 'Colon-separated provider stanzas of comma-separated key=value
+    pairs forming an OpenSSL provider config section. Each stanza must include
+    identity=<provider-name>; use module=/path/to/provider.so for out-of-tree
+    providers. Activation is automatic: every listed provider is activated,
+    and an activate key in the option value is ignored with a logged warning.
+    Requires a build against OpenSSL >= 3.0.
+    Example: identity=kae,module=/usr/lib64/kae_provider.so'
+  see_also:
+  - openssl_engine_opts
+  flags:
+  - startup
 - name: mempool_debug
   type: bool
   level: dev
