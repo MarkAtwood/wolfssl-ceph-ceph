@@ -14,6 +14,12 @@
 #include <openssl/bn.h>
 #include <openssl/rsa.h>
 
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#include <openssl/core_names.h>
+#include <openssl/param_build.h>
+#include <openssl/params.h>
+#endif
+
 #include "rgw/rgw_b64.h"
 
 //If openssl version less than 1.1
@@ -322,6 +328,29 @@ namespace jwt {
 			{
 				std::string n_str = base64_decode_url(modulus);
 				std::string e_str = base64_decode_url(exponent);
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+				std::unique_ptr<BIGNUM, decltype(&BN_free)> n(BN_bin2bn((const unsigned char*)n_str.data(), n_str.size(), nullptr), BN_free);
+				std::unique_ptr<BIGNUM, decltype(&BN_free)> e(BN_bin2bn((const unsigned char*)e_str.data(), e_str.size(), nullptr), BN_free);
+				if (!n || !e)
+					throw rsa_exception("Invalid encoding for modulus or exponent\n");
+
+				std::unique_ptr<OSSL_PARAM_BLD, decltype(&OSSL_PARAM_BLD_free)> bld(OSSL_PARAM_BLD_new(), OSSL_PARAM_BLD_free);
+				if (!bld ||
+				    OSSL_PARAM_BLD_push_BN(bld.get(), OSSL_PKEY_PARAM_RSA_N, n.get()) != 1 ||
+				    OSSL_PARAM_BLD_push_BN(bld.get(), OSSL_PKEY_PARAM_RSA_E, e.get()) != 1)
+					throw rsa_exception("failed to build RSA key parameters");
+				std::unique_ptr<OSSL_PARAM, decltype(&OSSL_PARAM_free)> params(OSSL_PARAM_BLD_to_param(bld.get()), OSSL_PARAM_free);
+				if (!params)
+					throw rsa_exception("failed to build RSA key parameters");
+
+				std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> kctx(EVP_PKEY_CTX_new_from_name(nullptr, "RSA", nullptr), EVP_PKEY_CTX_free);
+				EVP_PKEY* raw_pkey = nullptr;
+				if (!kctx ||
+				    EVP_PKEY_fromdata_init(kctx.get()) != 1 ||
+				    EVP_PKEY_fromdata(kctx.get(), &raw_pkey, EVP_PKEY_PUBLIC_KEY, params.get()) != 1)
+					throw rsa_exception("failed to construct RSA public key from modulus/exponent");
+				pkey.reset(raw_pkey, EVP_PKEY_free);
+#else
 				unsigned char* u_n = (unsigned char *)n_str.c_str();
 				unsigned char* u_e = (unsigned char *)e_str.c_str();
 				BIGNUM *n = BN_bin2bn(u_n, n_str.size(), NULL);
@@ -339,6 +368,7 @@ namespace jwt {
 					if (e) BN_free(e);
 					throw rsa_exception("Invalid encoding for modulus or exponent\n");
 				}
+#endif
 			}
 
 			std::string base64_decode_url(const std::string& str) const {
