@@ -556,18 +556,23 @@ namespace jwt {
 			 * \throws signature_generation_exception
 			 */
 			std::string sign(const std::string& data) const {
-				auto hash = this->generate_hash(data);
-
-				std::unique_ptr<RSA, decltype(&RSA_free)> key(EVP_PKEY_get1_RSA(pkey.get()), RSA_free);
-				const int size = RSA_size(key.get());
-
-				std::string padded(size, 0x00);
-				if (!RSA_padding_add_PKCS1_PSS_mgf1(key.get(), (unsigned char*)padded.data(), (const unsigned char*)hash.data(), md(), md(), -1))  
-					throw signature_generation_exception("failed to create signature: RSA_padding_add_PKCS1_PSS_mgf1 failed");
-
-				std::string res(size, 0x00);
-				if (RSA_private_encrypt(size, (const unsigned char*)padded.data(), (unsigned char*)res.data(), key.get(), RSA_NO_PADDING) < 0)
-					throw signature_generation_exception("failed to create signature: RSA_private_encrypt failed");
+				std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+				if (!ctx)
+					throw signature_generation_exception("failed to create signature: could not create context");
+				EVP_PKEY_CTX* pctx = nullptr;
+				if (EVP_DigestSignInit(ctx.get(), &pctx, md(), nullptr, pkey.get()) != 1)
+					throw signature_generation_exception("failed to create signature: DigestSignInit failed");
+				if (EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PSS_PADDING) != 1 ||
+				    EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx, RSA_PSS_SALTLEN_DIGEST) != 1 ||
+				    EVP_PKEY_CTX_set_rsa_mgf1_md(pctx, md()) != 1)
+					throw signature_generation_exception("failed to create signature: could not configure PSS padding");
+				size_t siglen = 0;
+				if (EVP_DigestSign(ctx.get(), nullptr, &siglen, (const unsigned char*)data.data(), data.size()) != 1)
+					throw signature_generation_exception("failed to create signature: DigestSign failed");
+				std::string res(siglen, '\0');
+				if (EVP_DigestSign(ctx.get(), (unsigned char*)res.data(), &siglen, (const unsigned char*)data.data(), data.size()) != 1)
+					throw signature_generation_exception("failed to create signature: DigestSign failed");
+				res.resize(siglen);
 				return res;
 			}
 			/**
@@ -577,16 +582,17 @@ namespace jwt {
 			 * \throws signature_verification_exception If the provided signature does not match
 			 */
 			void verify(const std::string& data, const std::string& signature) const {
-				auto hash = this->generate_hash(data);
-
-				std::unique_ptr<RSA, decltype(&RSA_free)> key(EVP_PKEY_get1_RSA(pkey.get()), RSA_free);
-				const int size = RSA_size(key.get());
-				
-				std::string sig(size, 0x00);
-				if(!RSA_public_decrypt(signature.size(), (const unsigned char*)signature.data(), (unsigned char*)sig.data(), key.get(), RSA_NO_PADDING))
+				std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+				if (!ctx)
+					throw signature_generation_exception("could not create context");
+				EVP_PKEY_CTX* pctx = nullptr;
+				if (EVP_DigestVerifyInit(ctx.get(), &pctx, md(), nullptr, pkey.get()) != 1)
 					throw signature_verification_exception("Invalid signature");
-				
-				if(!RSA_verify_PKCS1_PSS_mgf1(key.get(), (const unsigned char*)hash.data(), md(), md(), (const unsigned char*)sig.data(), -1))
+				if (EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PSS_PADDING) != 1 ||
+				    EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx, RSA_PSS_SALTLEN_DIGEST) != 1 ||
+				    EVP_PKEY_CTX_set_rsa_mgf1_md(pctx, md()) != 1)
+					throw signature_verification_exception("Invalid signature");
+				if (EVP_DigestVerify(ctx.get(), (const unsigned char*)signature.data(), signature.size(), (const unsigned char*)data.data(), data.size()) != 1)
 					throw signature_verification_exception("Invalid signature");
 			}
 			/**
@@ -597,30 +603,6 @@ namespace jwt {
 				return alg_name;
 			}
 		private:
-			/**
-			 * Hash the provided data using the hash function specified in constructor
-			 * \param data Data to hash
-			 * \return Hash of data
-			 */
-			std::string generate_hash(const std::string& data) const {
-#ifdef OPENSSL10
-				std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_destroy)> ctx(EVP_MD_CTX_create(), &EVP_MD_CTX_destroy);
-#else
-				std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
-#endif
-				if(EVP_DigestInit(ctx.get(), md()) == 0)
-					throw signature_generation_exception("EVP_DigestInit failed");
-				if(EVP_DigestUpdate(ctx.get(), data.data(), data.size()) == 0)
-					throw signature_generation_exception("EVP_DigestUpdate failed");
-				unsigned int len = 0;
-				std::string res;
-				res.resize(EVP_MD_CTX_size(ctx.get()));
-				if(EVP_DigestFinal(ctx.get(), (unsigned char*)res.data(), &len) == 0)
-					throw signature_generation_exception("EVP_DigestFinal failed");
-				res.resize(len);
-				return res;
-			}
-			
 			/// OpenSSL structure containing keys
 			std::shared_ptr<EVP_PKEY> pkey;
 			/// Hash generator function
