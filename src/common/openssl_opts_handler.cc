@@ -15,9 +15,11 @@
 #include "openssl_opts_handler.h"
 
 #include <openssl/bio.h>
+#include <openssl/err.h>
 #include <openssl/conf.h>
 #include <openssl/opensslv.h>
-#ifndef OPENSSL_NO_ENGINE
+#if !defined(OPENSSL_NO_ENGINE) && OPENSSL_VERSION_NUMBER < 0x30000000L
+#define CEPH_OPENSSL_USE_ENGINE
 #include <openssl/engine.h>
 #endif
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
@@ -47,7 +49,7 @@ static ostream &_prefix(std::ostream *_dout)
   return *_dout << "OpenSSLOptsHandler: ";
 }
 
-#ifndef OPENSSL_NO_ENGINE
+#ifdef CEPH_OPENSSL_USE_ENGINE
 
 // -----------------------------------------------------------------------------
 
@@ -77,7 +79,7 @@ string construct_engine_conf(const string &opts)
 
   return conf_header + engine_header + engine_statement + engine_detail;
 }
-#endif // !OPENSSL_NO_ENGINE
+#endif // CEPH_OPENSSL_USE_ENGINE
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
 string construct_provider_conf(const string &opts)
@@ -154,16 +156,9 @@ void load_module(const string &conf_str, const string &opt_name)
   }
 
   OPENSSL_load_builtin_modules();
-#ifndef OPENSSL_NO_ENGINE
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-  ENGINE_load_builtin_engines();
-#pragma clang diagnostic pop
-#pragma GCC diagnostic pop
-#endif // !OPENSSL_NO_ENGINE
+#ifdef CEPH_OPENSSL_USE_ENGINE
+  ENGINE_load_builtin_engines();  // not deprecated pre-3.0
+#endif
 
   if (CONF_modules_load(
           conf, nullptr,
@@ -202,17 +197,15 @@ void verify_providers_available(const string &opts)
 }
 #endif // OPENSSL_VERSION_NUMBER >= 0x30000000L
 
-void init_engine()
+void init_openssl_opts()
 {
-  string opts = g_ceph_context->_conf->openssl_engine_opts;
-  if (!opts.empty()) {
-#ifdef OPENSSL_NO_ENGINE
-    derr << "OpenSSL is compiled with no engine, but openssl_engine_opts is set" << dendl;
-#else
-    load_module(construct_engine_conf(opts), "openssl_engine_opts");
-#endif
-  }
+  string engine_opts = g_ceph_context->_conf->openssl_engine_opts;
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
+  if (!engine_opts.empty()) {
+    derr << "openssl_engine_opts is set, but this build uses OpenSSL 3, "
+         << "which deprecates ENGINE support; the option is ignored. "
+         << "Use openssl_provider_opts instead." << dendl;
+  }
   string provider_opts =
       g_ceph_context->_conf.get_val<string>("openssl_provider_opts");
   if (!provider_opts.empty()) {
@@ -223,11 +216,20 @@ void init_engine()
   if (!g_ceph_context->_conf.get_val<string>("openssl_provider_opts").empty()) {
     derr << "openssl_provider_opts requires OpenSSL >= 3.0; ignored" << dendl;
   }
+#ifdef CEPH_OPENSSL_USE_ENGINE
+  if (!engine_opts.empty()) {
+    load_module(construct_engine_conf(engine_opts), "openssl_engine_opts");
+  }
+#else
+  if (!engine_opts.empty()) {
+    derr << "OpenSSL is compiled with no engine, but openssl_engine_opts is set" << dendl;
+  }
+#endif
 #endif
 }
 
-void ceph::crypto::init_openssl_engine_once()
+void ceph::crypto::init_openssl_opts_once()
 {
   static std::once_flag flag;
-  std::call_once(flag, init_engine);
+  std::call_once(flag, init_openssl_opts);
 }

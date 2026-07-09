@@ -169,7 +169,7 @@ void rgw::AppMain::init_frontends1(bool nfs)
     g_conf().set_val_or_die("rgw_zonegroup", g_conf()->rgw_region.c_str());
   }
 
-  ceph::crypto::init_openssl_engine_once();
+  ceph::crypto::init_openssl_opts_once();
 } /* init_frontends1 */
 
 void rgw::AppMain::init_numa()

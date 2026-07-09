@@ -817,8 +817,12 @@ options:
 - name: openssl_engine_opts
   type: str
   level: advanced
-  desc: Use engine for specific openssl algorithm
-  long_desc: 'Pass opts in this way: engine_id=engine1,dynamic_path=/some/path/engine1.so,default_algorithms=DIGESTS:engine_id=engine2,dynamic_path=/some/path/engine2.so,default_algorithms=CIPHERS,other_ctrl=other_value'
+  desc: Use engine for specific openssl algorithm (deprecated)
+  long_desc: 'Only effective when Ceph is built against OpenSSL < 3.0; ignored
+    with a logged error on OpenSSL 3 builds. Use openssl_provider_opts instead.
+    Pass opts in this way: engine_id=engine1,dynamic_path=/some/path/engine1.so,default_algorithms=DIGESTS:engine_id=engine2,dynamic_path=/some/path/engine2.so,default_algorithms=CIPHERS,other_ctrl=other_value'
+  see_also:
+  - openssl_provider_opts
   flags:
   - startup
   with_legacy: true

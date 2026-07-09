@@ -17,7 +17,7 @@
 
 namespace ceph {
   namespace crypto {
-    void init_openssl_engine_once();
+    void init_openssl_opts_once();
   }
 }
 
