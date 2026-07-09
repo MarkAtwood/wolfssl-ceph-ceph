@@ -2409,7 +2409,7 @@ inline int encode_dlo_manifest_attr(const char * const dlo_manifest,
   return 0;
 } /* encode_dlo_manifest_attr */
 
-inline void complete_etag(MD5& hash, std::string *etag)
+inline void complete_etag(MD5NonCrypto& hash, std::string *etag)
 {
   char etag_buf[CEPH_CRYPTO_MD5_DIGESTSIZE];
   char etag_buf_str[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 16];

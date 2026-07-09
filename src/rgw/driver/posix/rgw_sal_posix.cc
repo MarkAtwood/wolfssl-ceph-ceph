@@ -3437,9 +3437,7 @@ int POSIXObject::generate_etag(const DoutPrefixProvider* dpp, optional_yield y)
 {
   int64_t left = get_size();
   int64_t cur_ofs = 0;
-  MD5 hash;
-  // Allow use of MD5 digest in FIPS mode for non-cryptographic purposes
-  hash.SetFlags(EVP_MD_CTX_FLAG_NON_FIPS_ALLOW);
+  MD5NonCrypto hash;
   char calc_md5[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 1];
   unsigned char m[CEPH_CRYPTO_MD5_DIGESTSIZE];
 
@@ -3750,9 +3748,7 @@ int POSIXMultipartUpload::complete(const DoutPrefixProvider *dpp,
   char final_etag_str[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 16];
   std::string etag;
   bufferlist etag_bl;
-  MD5 hash;
-  // Allow use of MD5 digest in FIPS mode for non-cryptographic purposes
-  hash.SetFlags(EVP_MD_CTX_FLAG_NON_FIPS_ALLOW);
+  MD5NonCrypto hash;
   bool truncated;
   int ret;
 
