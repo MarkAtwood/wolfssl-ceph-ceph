@@ -365,6 +365,7 @@ namespace jwt {
 			ecdsa(const std::string& public_key, const std::string& private_key, const std::string& public_key_password, const std::string& private_key_password, const EVP_MD*(*md)(), const std::string& name, size_t siglen)
 				: md(md), alg_name(name), signature_length(siglen)
 			{
+				bool has_private_key = false;
 				if (!public_key.empty()) {
 					std::unique_ptr<BIO, decltype(&BIO_free_all)> pubkey_bio(BIO_new(BIO_s_mem()), BIO_free_all);
 					if(public_key.substr(0, 27) == "-----BEGIN CERTIFICATE-----") {
@@ -376,10 +377,12 @@ namespace jwt {
 							throw ecdsa_exception("failed to load public key: bio_write failed");
 					}
 
-					pkey.reset(PEM_read_bio_EC_PUBKEY(pubkey_bio.get(), nullptr, nullptr, (void*)public_key_password.c_str()), EC_KEY_free);
+					pkey.reset(PEM_read_bio_PUBKEY(pubkey_bio.get(), nullptr, nullptr, (void*)public_key_password.c_str()), EVP_PKEY_free);
 					if (!pkey)
-						throw ecdsa_exception("failed to load public key: PEM_read_bio_EC_PUBKEY failed:" + std::string(ERR_error_string(ERR_get_error(), NULL)));
-					size_t keysize = EC_GROUP_get_degree(EC_KEY_get0_group(pkey.get()));
+						throw ecdsa_exception("failed to load public key: PEM_read_bio_PUBKEY failed:" + std::string(ERR_error_string(ERR_get_error(), NULL)));
+					if (EVP_PKEY_base_id(pkey.get()) != EVP_PKEY_EC)
+						throw ecdsa_exception("failed to load public key: not an EC key");
+					size_t keysize = EVP_PKEY_bits(pkey.get());
 					if(keysize != signature_length*4 && (signature_length != 132 || keysize != 521))
 						throw ecdsa_exception("invalid key size");
 				}
@@ -388,17 +391,22 @@ namespace jwt {
 					std::unique_ptr<BIO, decltype(&BIO_free_all)> privkey_bio(BIO_new(BIO_s_mem()), BIO_free_all);
 					if ((size_t)BIO_write(privkey_bio.get(), private_key.data(), private_key.size()) != private_key.size())
 						throw rsa_exception("failed to load private key: bio_write failed");
-					pkey.reset(PEM_read_bio_ECPrivateKey(privkey_bio.get(), nullptr, nullptr, const_cast<char*>(private_key_password.c_str())), EC_KEY_free);
+					pkey.reset(PEM_read_bio_PrivateKey(privkey_bio.get(), nullptr, nullptr, const_cast<char*>(private_key_password.c_str())), EVP_PKEY_free);
 					if (!pkey)
-						throw rsa_exception("failed to load private key: PEM_read_bio_ECPrivateKey failed");
-					size_t keysize = EC_GROUP_get_degree(EC_KEY_get0_group(pkey.get()));
+						throw rsa_exception("failed to load private key: PEM_read_bio_PrivateKey failed");
+					if (EVP_PKEY_base_id(pkey.get()) != EVP_PKEY_EC)
+						throw rsa_exception("failed to load private key: not an EC key");
+					has_private_key = true;
+					size_t keysize = EVP_PKEY_bits(pkey.get());
 					if(keysize != signature_length*4 && (signature_length != 132 || keysize != 521))
 						throw ecdsa_exception("invalid key size");
 				}
 				if(!pkey)
 					throw rsa_exception("at least one of public or private key need to be present");
 
-				if(EC_KEY_check_key(pkey.get()) == 0)
+				std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> check_ctx(EVP_PKEY_CTX_new(pkey.get(), nullptr), EVP_PKEY_CTX_free);
+				if(!check_ctx ||
+				   (has_private_key ? EVP_PKEY_check(check_ctx.get()) : EVP_PKEY_public_check(check_ctx.get())) != 1)
 					throw ecdsa_exception("failed to load key: key is invalid");
 			}
 			/**
@@ -408,28 +416,36 @@ namespace jwt {
 			 * \throws signature_generation_exception
 			 */
 			std::string sign(const std::string& data) const {
-				const std::string hash = generate_hash(data);
+				std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+				if (!ctx)
+					throw signature_generation_exception("failed to create signature: could not create context");
+				if (EVP_DigestSignInit(ctx.get(), nullptr, md(), nullptr, pkey.get()) != 1)
+					throw signature_generation_exception();
+				size_t der_len = 0;
+				if (EVP_DigestSign(ctx.get(), nullptr, &der_len, (const unsigned char*)data.data(), data.size()) != 1)
+					throw signature_generation_exception();
+				std::string der_sig(der_len, '\0');
+				if (EVP_DigestSign(ctx.get(), (unsigned char*)der_sig.data(), &der_len, (const unsigned char*)data.data(), data.size()) != 1)
+					throw signature_generation_exception();
+				der_sig.resize(der_len);
 
-				std::unique_ptr<ECDSA_SIG, decltype(&ECDSA_SIG_free)>
-					sig(ECDSA_do_sign((const unsigned char*)hash.data(), hash.size(), pkey.get()), ECDSA_SIG_free);
+				const unsigned char* p = (const unsigned char*)der_sig.data();
+				std::unique_ptr<ECDSA_SIG, decltype(&ECDSA_SIG_free)> sig(d2i_ECDSA_SIG(nullptr, &p, der_sig.size()), ECDSA_SIG_free);
 				if(!sig)
 					throw signature_generation_exception();
-#ifdef OPENSSL10
 
-				auto rr = bn2raw(sig->r);
-				auto rs = bn2raw(sig->s);
-#else
 				const BIGNUM *r;
 				const BIGNUM *s;
 				ECDSA_SIG_get0(sig.get(), &r, &s);
-				auto rr = bn2raw(r);
-				auto rs = bn2raw(s);
-#endif
-				if(rr.size() > signature_length/2 || rs.size() > signature_length/2)
+
+				const size_t half = signature_length/2;
+				if((size_t)BN_num_bytes(r) > half || (size_t)BN_num_bytes(s) > half)
 					throw std::logic_error("bignum size exceeded expected length");
-				while(rr.size() != signature_length/2) rr = '\0' + rr;
-				while(rs.size() != signature_length/2) rs = '\0' + rs;
-				return rr + rs;
+				std::string res(signature_length, '\0');
+				if (BN_bn2binpad(r, (unsigned char*)res.data(), half) < 0 ||
+				    BN_bn2binpad(s, (unsigned char*)res.data() + half, half) < 0)
+					throw signature_generation_exception();
+				return res;
 			}
 
 			/**
@@ -439,25 +455,30 @@ namespace jwt {
 			 * \throws signature_verification_exception If the provided signature does not match
 			 */
 			void verify(const std::string& data, const std::string& signature) const {
-				const std::string hash = generate_hash(data);
 				auto r = raw2bn(signature.substr(0, signature.size() / 2));
 				auto s = raw2bn(signature.substr(signature.size() / 2));
 
-#ifdef OPENSSL10
-				ECDSA_SIG sig;
-				sig.r = r.get();
-				sig.s = s.get();
-
-				if(ECDSA_do_verify((const unsigned char*)hash.data(), hash.size(), &sig, pkey.get()) != 1)
-					throw signature_verification_exception("Invalid signature");
-#else
 				std::unique_ptr<ECDSA_SIG, decltype(&ECDSA_SIG_free)> sig(ECDSA_SIG_new(), ECDSA_SIG_free);
-
-				ECDSA_SIG_set0(sig.get(), r.release(), s.release());
-
-				if(ECDSA_do_verify((const unsigned char*)hash.data(), hash.size(), sig.get(), pkey.get()) != 1)
+				if(!sig || !r || !s || ECDSA_SIG_set0(sig.get(), r.get(), s.get()) != 1)
 					throw signature_verification_exception("Invalid signature");
-#endif
+				r.release();
+				s.release();
+
+				const int der_len = i2d_ECDSA_SIG(sig.get(), nullptr);
+				if(der_len <= 0)
+					throw signature_verification_exception("Invalid signature");
+				std::string der_sig(der_len, '\0');
+				unsigned char* p = (unsigned char*)der_sig.data();
+				if(i2d_ECDSA_SIG(sig.get(), &p) != der_len)
+					throw signature_verification_exception("Invalid signature");
+
+				std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+				if (!ctx)
+					throw signature_generation_exception("could not create context");
+				if (EVP_DigestVerifyInit(ctx.get(), nullptr, md(), nullptr, pkey.get()) != 1)
+					throw signature_verification_exception("Invalid signature");
+				if (EVP_DigestVerify(ctx.get(), (const unsigned char*)der_sig.data(), der_sig.size(), (const unsigned char*)data.data(), data.size()) != 1)
+					throw signature_verification_exception("Invalid signature");
 			}
 			/**
 			 * Returns the algorithm name provided to the constructor
@@ -468,22 +489,6 @@ namespace jwt {
 			}
 		private:
 			/**
-			 * Convert a OpenSSL BIGNUM to a std::string
-			 * \param bn BIGNUM to convert
-			 * \return bignum as string
-			 */
-#ifdef OPENSSL10
-			static std::string bn2raw(BIGNUM* bn)
-#else
-			static std::string bn2raw(const BIGNUM* bn)
-#endif
-			{
-				std::string res;
-				res.resize(BN_num_bytes(bn));
-				BN_bn2bin(bn, (unsigned char*)res.data());
-				return res;
-			}
-			/**
 			 * Convert an std::string to a OpenSSL BIGNUM
 			 * \param raw String to convert
 			 * \return BIGNUM representation
@@ -492,32 +497,8 @@ namespace jwt {
 				return std::unique_ptr<BIGNUM, decltype(&BN_free)>(BN_bin2bn((const unsigned char*)raw.data(), raw.size(), nullptr), BN_free);
 			}
 
-			/**
-			 * Hash the provided data using the hash function specified in constructor
-			 * \param data Data to hash
-			 * \return Hash of data
-			 */
-			std::string generate_hash(const std::string& data) const {
-#ifdef OPENSSL10
-				std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_destroy)> ctx(EVP_MD_CTX_create(), &EVP_MD_CTX_destroy);
-#else
-				std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
-#endif
-				if(EVP_DigestInit(ctx.get(), md()) == 0)
-					throw signature_generation_exception("EVP_DigestInit failed");
-				if(EVP_DigestUpdate(ctx.get(), data.data(), data.size()) == 0)
-					throw signature_generation_exception("EVP_DigestUpdate failed");
-				unsigned int len = 0;
-				std::string res;
-				res.resize(EVP_MD_CTX_size(ctx.get()));
-				if(EVP_DigestFinal(ctx.get(), (unsigned char*)res.data(), &len) == 0)
-					throw signature_generation_exception("EVP_DigestFinal failed");
-				res.resize(len);
-				return res;
-			}
-
 			/// OpenSSL struct containing keys
-			std::shared_ptr<EC_KEY> pkey;
+			std::shared_ptr<EVP_PKEY> pkey;
 			/// Hash generator function
 			const EVP_MD*(*md)();
 			/// Algorithmname
