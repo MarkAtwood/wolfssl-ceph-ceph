@@ -4,6 +4,7 @@
 
 #include "acconfig.h"
 #include <stdexcept>
+#include <vector>
 
 #include "include/common_fwd.h"
 #include "include/buffer.h"
@@ -20,6 +21,10 @@
 #include <openssl/evp.h>
 #include <openssl/ossl_typ.h>
 #include <openssl/hmac.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#include <openssl/core_names.h>
+#include <openssl/params.h>
+#endif
 
 #include "include/ceph_assert.h"
 
@@ -134,7 +139,7 @@ namespace TOPNSPC::crypto {
       }
     }
   };
-# else
+# elif OPENSSL_VERSION_NUMBER < 0x30000000L
   class HMAC {
   private:
     HMAC_CTX *mpContext;
@@ -171,6 +176,81 @@ namespace TOPNSPC::crypto {
       const auto r = HMAC_Final(mpContext, digest, &s);
       if (r != 1) {
 	throw DigestException("HMAC_Final() failed");
+      }
+    }
+  };
+# else
+  // OpenSSL 3.x deprecated the HMAC_CTX API. Use EVP_MAC so the whole
+  // keyed-hash construction, not just the underlying digest, is served
+  // by the provider selected in the library context.
+  class HMAC {
+  private:
+    static EVP_MAC *get_evp_mac() {
+      // process-lifetime cache; deliberately never freed, matching the
+      // lifetime OpenSSL gives its own implicitly fetched algorithms
+      static EVP_MAC * const mac = EVP_MAC_fetch(nullptr, "HMAC", nullptr);
+      return mac;
+    }
+    EVP_MAC_CTX *mpContext;
+    // kept so Restart() can re-key explicitly; see below
+    std::vector<unsigned char> mKey;
+
+  public:
+    HMAC (const EVP_MD *type, const unsigned char *key, size_t length)
+      : mKey(key, key + length) {
+      EVP_MAC * const mac = get_evp_mac();
+      if (mac == nullptr) {
+	throw DigestException("EVP_MAC_fetch() failed");
+      }
+      mpContext = EVP_MAC_CTX_new(mac);
+      if (mpContext == nullptr) {
+	throw DigestException("EVP_MAC_CTX_new() failed");
+      }
+      const OSSL_PARAM params[] = {
+	OSSL_PARAM_construct_utf8_string(
+	  OSSL_MAC_PARAM_DIGEST,
+	  const_cast<char*>(EVP_MD_get0_name(type)), 0),
+	OSSL_PARAM_construct_end()
+      };
+      const auto r = EVP_MAC_init(mpContext, key, length, params);
+      if (r != 1) {
+	EVP_MAC_CTX_free(mpContext);
+	throw DigestException("EVP_MAC_init() failed");
+      }
+    }
+    ~HMAC () {
+      EVP_MAC_CTX_free(mpContext);
+      if (!mKey.empty()) {
+	::TOPNSPC::crypto::zeroize_for_security(mKey.data(), mKey.size());
+      }
+    }
+
+    void Restart () {
+      // re-key explicitly rather than passing a NULL key: the reference
+      // provider re-keys and resets on a NULL-key init (since 3.0.3,
+      // openssl/openssl#17811), but that is not part of the EVP_MAC
+      // contract and other providers keep the running state instead.
+      // The digest established at construction persists in the context.
+      const auto r = EVP_MAC_init(mpContext, mKey.data(), mKey.size(),
+				  nullptr);
+      if (r != 1) {
+	throw DigestException("EVP_MAC_init() failed");
+      }
+    }
+    void Update (const unsigned char *input, size_t length) {
+      if (length) {
+        const auto r = EVP_MAC_update(mpContext, input, length);
+	if (r != 1) {
+	  throw DigestException("EVP_MAC_update() failed");
+	}
+      }
+    }
+    void Final (unsigned char *digest) {
+      size_t s;
+      const auto r = EVP_MAC_final(mpContext, digest, &s,
+				   EVP_MAC_CTX_get_mac_size(mpContext));
+      if (r != 1) {
+	throw DigestException("EVP_MAC_final() failed");
       }
     }
   };
