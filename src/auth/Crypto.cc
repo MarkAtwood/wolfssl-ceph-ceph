@@ -16,12 +16,7 @@
 #include <limits>
 #include <fcntl.h>
 
-#if defined(WITH_WOLFCRYPT_CEPHX)
-#include <wolfssl/options.h>
-#include <wolfssl/wolfcrypt/aes.h>
-#else
-#include <openssl/aes.h>
-#endif
+#include <openssl/evp.h>
 
 #include "Crypto.h"
 
@@ -37,12 +32,6 @@
 #include "common/Formatter.h"
 #include "common/debug.h"
 #include <errno.h>
-
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 using std::ostringstream;
 using std::string;
@@ -276,32 +265,41 @@ public:
 static constexpr const std::size_t AES_KEY_LEN{16};
 static constexpr const std::size_t AES_BLOCK_LEN{16};
 
-#if !defined(WITH_WOLFCRYPT_CEPHX)
+// the low-level AES_* API is deprecated since OpenSSL 3.0 and is wired
+// directly to the built-in software implementation, bypassing provider
+// dispatch entirely, so provider-based configurations (e.g. FIPS) never
+// see cephx traffic. EVP with an explicitly fetched cipher routes every
+// operation through the loaded providers.
 class CryptoAESKeyHandler : public CryptoKeyHandler {
-  AES_KEY enc_key;
-  AES_KEY dec_key;
+  // fetched once in init(). The EVP_CIPHER is immutable and safe to
+  // share across the messenger threads sharing this handler; an
+  // EVP_CIPHER_CTX carries the CBC chaining state and is not, so every
+  // operation creates its own context.
+  EVP_CIPHER* cipher = nullptr;
 
 public:
   CryptoAESKeyHandler()
     : CryptoKeyHandler(CryptoKeyHandler::BLOCK_SIZE_16B()) {
   }
 
+  CryptoAESKeyHandler(const CryptoAESKeyHandler&) = delete;
+  CryptoAESKeyHandler& operator=(const CryptoAESKeyHandler&) = delete;
+
+  ~CryptoAESKeyHandler() override {
+    EVP_CIPHER_free(cipher);
+  }
+
   int init(const bufferptr& s, ostringstream& err) {
     secret = s;
 
-    const int enc_key_ret = \
-      AES_set_encrypt_key((const unsigned char*)secret.c_str(),
-			  AES_KEY_LEN * CHAR_BIT, &enc_key);
-    if (enc_key_ret != 0) {
-      err << "cannot set OpenSSL encrypt key for AES: " << enc_key_ret;
-      return -1;
-    }
-
-    const int dec_key_ret = \
-      AES_set_decrypt_key((const unsigned char*)secret.c_str(),
-			  AES_KEY_LEN * CHAR_BIT, &dec_key);
-    if (dec_key_ret != 0) {
-      err << "cannot set OpenSSL decrypt key for AES: " << dec_key_ret;
+    // fetch explicitly so the implementation is attributed unambiguously
+    // to the loaded providers; if none of them offers AES-128-CBC, fail
+    // here instead of falling back silently. On re-init, drop the
+    // previously fetched cipher first.
+    EVP_CIPHER_free(cipher);
+    cipher = EVP_CIPHER_fetch(nullptr, "AES-128-CBC", nullptr);
+    if (cipher == nullptr) {
+      err << "cannot fetch AES-128-CBC cipher from OpenSSL providers";
       return -1;
     }
 
@@ -311,6 +309,12 @@ public:
   int encrypt(const ceph::bufferlist& in,
 	      ceph::bufferlist& out,
               std::string* /* unused */) const override {
+    // EVP_EncryptUpdate takes the input length as an int. cephx payloads
+    // are tiny (tickets and signatures), so reject rather than chunk.
+    if (in.length() > std::numeric_limits<int>::max() - AES_BLOCK_LEN) {
+      return -1;
+    }
+
     // we need to take into account the PKCS#7 padding. There *always* will
     // be at least one byte of padding. This stays even to input aligned to
     // AES_BLOCK_LEN. Otherwise we would face ambiguities during decryption.
@@ -332,19 +336,34 @@ public:
     incopy.append(std::move(pad_buf));
     const auto in_buf = reinterpret_cast<unsigned char*>(incopy.c_str());
 
-    // reinitialize IV each time. It might be unnecessary depending on
-    // actual implementation but at the interface layer we are obliged
-    // to deliver IV as non-const.
     static_assert(strlen_ct(CEPH_AES_IV) == AES_BLOCK_LEN);
-    unsigned char iv[AES_BLOCK_LEN];
-    memcpy(iv, CEPH_AES_IV, AES_BLOCK_LEN);
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (ctx == nullptr) {
+      return -1;
+    }
+    if (EVP_EncryptInit_ex(ctx, cipher, nullptr,
+			   (const unsigned char*)secret.c_str(),
+			   (const unsigned char*)CEPH_AES_IV) != 1) {
+      EVP_CIPHER_CTX_free(ctx);
+      return -1;
+    }
+    // the PKCS#7 padding above is part of the cephx wire format; the
+    // cipher must not pad again.
+    EVP_CIPHER_CTX_set_padding(ctx, 0);
 
-    // we aren't using EVP because of performance concerns. Profiling
-    // shows the cost is quite high. Endianness might be an issue.
-    // However, as they would affect Cephx, any fallout should pop up
-    // rather early, hopefully.
-    AES_cbc_encrypt(in_buf, reinterpret_cast<unsigned char*>(out_tmp.c_str()),
-		    out_tmp.length(), &enc_key, iv, AES_ENCRYPT);
+    auto out_buf = reinterpret_cast<unsigned char*>(out_tmp.c_str());
+    int len = 0;
+    if (EVP_EncryptUpdate(ctx, out_buf, &len, in_buf,
+			  static_cast<int>(out_tmp.length())) != 1) {
+      EVP_CIPHER_CTX_free(ctx);
+      return -1;
+    }
+    int final_len = 0;
+    if (EVP_EncryptFinal_ex(ctx, out_buf + len, &final_len) != 1) {
+      EVP_CIPHER_CTX_free(ctx);
+      return -1;
+    }
+    EVP_CIPHER_CTX_free(ctx);
 
     out.append(out_tmp);
     return 0;
@@ -354,7 +373,10 @@ public:
 	      ceph::bufferlist& out,
 	      std::string* /* unused */) const override {
     // PKCS#7 padding enlarges even empty plain-text to take 16 bytes.
-    if (in.length() < AES_BLOCK_LEN || in.length() % AES_BLOCK_LEN) {
+    // The upper bound keeps the length representable as the int that
+    // EVP_DecryptUpdate takes.
+    if (in.length() < AES_BLOCK_LEN || in.length() % AES_BLOCK_LEN ||
+	in.length() > std::numeric_limits<int>::max()) {
       return -1;
     }
 
@@ -362,14 +384,36 @@ public:
     ceph::bufferlist incopy(in);
     const auto in_buf = reinterpret_cast<unsigned char*>(incopy.c_str());
 
-    // make a local, modifiable copy of IV.
-    static_assert(strlen_ct(CEPH_AES_IV) == AES_BLOCK_LEN);
-    unsigned char iv[AES_BLOCK_LEN];
-    memcpy(iv, CEPH_AES_IV, AES_BLOCK_LEN);
-
     ceph::bufferptr out_tmp{in.length()};
-    AES_cbc_encrypt(in_buf, reinterpret_cast<unsigned char*>(out_tmp.c_str()),
-		    in.length(), &dec_key, iv, AES_DECRYPT);
+
+    static_assert(strlen_ct(CEPH_AES_IV) == AES_BLOCK_LEN);
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (ctx == nullptr) {
+      return -1;
+    }
+    if (EVP_DecryptInit_ex(ctx, cipher, nullptr,
+			   (const unsigned char*)secret.c_str(),
+			   (const unsigned char*)CEPH_AES_IV) != 1) {
+      EVP_CIPHER_CTX_free(ctx);
+      return -1;
+    }
+    // the padding is stripped below, after clamping; letting the cipher
+    // verify it would signal padding validity through the error path.
+    EVP_CIPHER_CTX_set_padding(ctx, 0);
+
+    auto out_buf = reinterpret_cast<unsigned char*>(out_tmp.c_str());
+    int len = 0;
+    if (EVP_DecryptUpdate(ctx, out_buf, &len, in_buf,
+			  static_cast<int>(in.length())) != 1) {
+      EVP_CIPHER_CTX_free(ctx);
+      return -1;
+    }
+    int final_len = 0;
+    if (EVP_DecryptFinal_ex(ctx, out_buf + len, &final_len) != 1) {
+      EVP_CIPHER_CTX_free(ctx);
+      return -1;
+    }
+    EVP_CIPHER_CTX_free(ctx);
 
     // BE CAREFUL: we cannot expose any single bit of information about
     // the cause of failure. Otherwise we'll face padding oracle attack.
@@ -404,21 +448,42 @@ public:
     // wipe out a secret after use.
     memset(last_block.data() + tail_len, pad_len, pad_len);
 
-    // need a local copy because AES_cbc_encrypt takes `iv` as non-const.
-    // Useful because it allows us to encrypt in two steps: main + tail.
-    static_assert(strlen_ct(CEPH_AES_IV) == AES_BLOCK_LEN);
-    std::array<unsigned char, AES_BLOCK_LEN> iv;
-    memcpy(iv.data(), CEPH_AES_IV, AES_BLOCK_LEN);
-
     const std::size_t main_encrypt_size = \
       std::min(in.length - tail_len, out.max_length);
-    AES_cbc_encrypt(in.buf, out.buf, main_encrypt_size, &enc_key, iv.data(),
-		    AES_ENCRYPT);
-
     const std::size_t tail_encrypt_size = \
       std::min(AES_BLOCK_LEN, out.max_length - main_encrypt_size);
-    AES_cbc_encrypt(last_block.data(), out.buf + main_encrypt_size,
-		    tail_encrypt_size, &enc_key, iv.data(), AES_ENCRYPT);
+
+    static_assert(strlen_ct(CEPH_AES_IV) == AES_BLOCK_LEN);
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (ctx == nullptr) {
+      throw std::runtime_error("EVP_CIPHER_CTX_new failed");
+    }
+    if (EVP_EncryptInit_ex(ctx, cipher, nullptr,
+			   (const unsigned char*)secret.c_str(),
+			   (const unsigned char*)CEPH_AES_IV) != 1) {
+      EVP_CIPHER_CTX_free(ctx);
+      throw std::runtime_error("EVP_EncryptInit_ex failed");
+    }
+    EVP_CIPHER_CTX_set_padding(ctx, 0);
+
+    // two chained updates: the ctx carries the CBC register from the main
+    // span into the padded last block, so the result matches a single pass
+    // over one contiguous buffer. All cephx callers pass block-aligned
+    // sizes here; if one ever didn't, the no-pad EVP path would buffer a
+    // partial final block instead of emitting it.
+    int len = 0;
+    if (EVP_EncryptUpdate(ctx, out.buf, &len, in.buf,
+			  static_cast<int>(main_encrypt_size)) != 1) {
+      EVP_CIPHER_CTX_free(ctx);
+      throw std::runtime_error("EVP_EncryptUpdate failed");
+    }
+    if (EVP_EncryptUpdate(ctx, out.buf + main_encrypt_size, &len,
+			  last_block.data(),
+			  static_cast<int>(tail_encrypt_size)) != 1) {
+      EVP_CIPHER_CTX_free(ctx);
+      throw std::runtime_error("EVP_EncryptUpdate failed");
+    }
+    EVP_CIPHER_CTX_free(ctx);
 
     return main_encrypt_size + tail_encrypt_size;
   }
@@ -437,11 +502,25 @@ public:
     }
 
     static_assert(strlen_ct(CEPH_AES_IV) == AES_BLOCK_LEN);
-    std::array<unsigned char, AES_BLOCK_LEN> iv;
-    memcpy(iv.data(), CEPH_AES_IV, AES_BLOCK_LEN);
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (ctx == nullptr) {
+      throw std::runtime_error("EVP_CIPHER_CTX_new failed");
+    }
+    if (EVP_DecryptInit_ex(ctx, cipher, nullptr,
+			   (const unsigned char*)secret.c_str(),
+			   (const unsigned char*)CEPH_AES_IV) != 1) {
+      EVP_CIPHER_CTX_free(ctx);
+      throw std::runtime_error("EVP_DecryptInit_ex failed");
+    }
+    EVP_CIPHER_CTX_set_padding(ctx, 0);
 
-    AES_cbc_encrypt(in.buf, out.buf, in.length, &dec_key, iv.data(),
-		    AES_DECRYPT);
+    int len = 0;
+    if (EVP_DecryptUpdate(ctx, out.buf, &len, in.buf,
+			  static_cast<int>(in.length)) != 1) {
+      EVP_CIPHER_CTX_free(ctx);
+      throw std::runtime_error("EVP_DecryptUpdate failed");
+    }
+    EVP_CIPHER_CTX_free(ctx);
 
     // NOTE: we aren't handling partial decrypt. PKCS#7 padding must be
     // at the end. If it's malformed, don't say a word to avoid risk of
@@ -451,212 +530,6 @@ public:
     return in.length - pad_len;
   }
 };
-
-#else  // WITH_WOLFCRYPT_CEPHX
-
-// Per-operation AES-128-CBC setup via wolfCrypt. Thread-safe by construction:
-// the Aes object lives on the caller's stack, so a CryptoAESKeyHandler shared
-// across messenger threads never shares mutable cipher state -- mirroring the
-// OpenSSL path's const AES_KEY + stack-local IV. `dir` is AES_ENCRYPTION or
-// AES_DECRYPTION. Returns 0 on success (caller must wc_AesFree the Aes) or a
-// wolfCrypt error (<0), in which case the Aes has already been freed.
-static int cephx_wc_aes_init(Aes* aes, int dir, const unsigned char* key) {
-  // Same compile-time IV-length guard the OpenSSL paths carry: wc_AesSetKey
-  // reads AES_BLOCK_LEN IV bytes from CEPH_AES_IV, so if that literal ever
-  // shrank this must fail to compile rather than read past it.
-  static_assert(strlen_ct(CEPH_AES_IV) == AES_BLOCK_LEN);
-  int r = wc_AesInit(aes, nullptr, INVALID_DEVID);
-  if (r != 0) {
-    return r;
-  }
-  r = wc_AesSetKey(aes, key, AES_KEY_LEN,
-                   (const unsigned char*)CEPH_AES_IV, dir);
-  if (r != 0) {
-    wc_AesFree(aes);
-    return r;
-  }
-  return 0;
-}
-
-class CryptoAESKeyHandler : public CryptoKeyHandler {
-public:
-  CryptoAESKeyHandler()
-    : CryptoKeyHandler(CryptoKeyHandler::BLOCK_SIZE_16B()) {
-  }
-
-  int init(const bufferptr& s, ostringstream& err) {
-    secret = s;
-    // The AES key schedule is (re)built per operation inside each encrypt/
-    // decrypt call via cephx_wc_aes_init(); the handler itself holds only the
-    // immutable key and so stays safe to share across threads. Validate the
-    // key length here, matching CryptoAES::validate_secret().
-    if (secret.length() < AES_KEY_LEN) {
-      err << "key too short for AES-128: " << secret.length();
-      return -1;
-    }
-    return 0;
-  }
-
-  int encrypt(const ceph::bufferlist& in,
-	      ceph::bufferlist& out,
-              std::string* /* unused */) const override {
-    // PKCS#7 padding is done here, above the cipher, exactly as in the OpenSSL
-    // path: there is *always* at least one byte of padding (a full block when
-    // the input is block-aligned), so decryption is never ambiguous.
-    ceph::bufferptr out_tmp{static_cast<unsigned>(
-      AES_BLOCK_LEN + p2align<std::size_t>(in.length(), AES_BLOCK_LEN))};
-
-    std::uint8_t pad_len = out_tmp.length() - in.length();
-    ceph::bufferptr pad_buf{pad_len};
-    // FIPS zeroization audit 20191115: this memset is not intended to
-    // wipe out a secret after use.
-    memset(pad_buf.c_str(), pad_len, pad_len);
-
-    ceph::bufferlist incopy(in);
-    incopy.append(std::move(pad_buf));
-    const auto in_buf = reinterpret_cast<unsigned char*>(incopy.c_str());
-
-    Aes aes;
-    if (cephx_wc_aes_init(&aes, AES_ENCRYPTION,
-			  (const unsigned char*)secret.c_str()) != 0) {
-      return -1;
-    }
-    const int cr = wc_AesCbcEncrypt(
-      &aes, reinterpret_cast<unsigned char*>(out_tmp.c_str()),
-      in_buf, out_tmp.length());
-    wc_AesFree(&aes);
-    if (cr != 0) {
-      return -1;
-    }
-
-    out.append(out_tmp);
-    return 0;
-  }
-
-  int decrypt(const ceph::bufferlist& in,
-	      ceph::bufferlist& out,
-              std::string* /* unused */) const override {
-    // PKCS#7 padding enlarges even empty plain-text to take 16 bytes.
-    if (in.length() < AES_BLOCK_LEN || in.length() % AES_BLOCK_LEN) {
-      return -1;
-    }
-
-    // needed because of .c_str() on const. It's a shallow copy.
-    ceph::bufferlist incopy(in);
-    const auto in_buf = reinterpret_cast<unsigned char*>(incopy.c_str());
-
-    ceph::bufferptr out_tmp{in.length()};
-
-    Aes aes;
-    if (cephx_wc_aes_init(&aes, AES_DECRYPTION,
-			  (const unsigned char*)secret.c_str()) != 0) {
-      return -1;
-    }
-    const int cr = wc_AesCbcDecrypt(
-      &aes, reinterpret_cast<unsigned char*>(out_tmp.c_str()),
-      in_buf, in.length());
-    wc_AesFree(&aes);
-    if (cr != 0) {
-      return -1;
-    }
-
-    // BE CAREFUL: we cannot expose any single bit of information about
-    // the cause of failure. Otherwise we'll face padding oracle attack.
-    // See: https://en.wikipedia.org/wiki/Padding_oracle_attack.
-    const auto pad_len = \
-      std::min<std::uint8_t>(out_tmp[in.length() - 1], AES_BLOCK_LEN);
-    out_tmp.set_length(in.length() - pad_len);
-    out.append(std::move(out_tmp));
-
-    return 0;
-  }
-
-  std::size_t encrypt(const in_slice_t& in,
-		      const out_slice_t& out) const override {
-    if (out.buf == nullptr) {
-      // 16 + p2align(10, 16) -> 16
-      // 16 + p2align(16, 16) -> 32
-      return AES_BLOCK_LEN + p2align<std::size_t>(in.length, AES_BLOCK_LEN);
-    }
-
-    const std::uint8_t tail_len = in.length % AES_BLOCK_LEN;
-    const std::uint8_t pad_len = AES_BLOCK_LEN - tail_len;
-    static_assert(std::numeric_limits<std::uint8_t>::max() > AES_BLOCK_LEN);
-
-    std::array<unsigned char, AES_BLOCK_LEN> last_block;
-    memcpy(last_block.data(), in.buf + in.length - tail_len, tail_len);
-    // FIPS zeroization audit 20191115: this memset is not intended to
-    // wipe out a secret after use.
-    memset(last_block.data() + tail_len, pad_len, pad_len);
-
-    const std::size_t main_encrypt_size = \
-      std::min(in.length - tail_len, out.max_length);
-    const std::size_t tail_encrypt_size = \
-      std::min(AES_BLOCK_LEN, out.max_length - main_encrypt_size);
-
-    Aes aes;
-    if (cephx_wc_aes_init(&aes, AES_ENCRYPTION,
-			  (const unsigned char*)secret.c_str()) != 0) {
-      return 0;
-    }
-    // Two chained CBC calls: wolfCrypt keeps the CBC register inside `aes`, so
-    // the tail block continues the chain from the main block exactly as the
-    // OpenSSL path's in-place-updated iv[] does. Real cephx callers always pass
-    // a block-aligned out buffer (see the out.buf==nullptr sizing above), so
-    // both sizes are multiples of AES_BLOCK_LEN. NOTE: this override is only
-    // byte-equivalent to the OpenSSL path for block-aligned sizes. If a caller
-    // ever passed an unaligned out.max_length, the two paths diverge: OpenSSL's
-    // AES_cbc_encrypt processes a final partial block, whereas wc_AesCbcEncrypt
-    // (default build, no WOLFSSL_AES_CBC_LENGTH_CHECKS) silently processes only
-    // whole blocks and returns 0. No current cephx caller hits this.
-    if (wc_AesCbcEncrypt(&aes, out.buf, in.buf, main_encrypt_size) != 0) {
-      wc_AesFree(&aes);
-      return 0;
-    }
-    if (wc_AesCbcEncrypt(&aes, out.buf + main_encrypt_size,
-			 last_block.data(), tail_encrypt_size) != 0) {
-      wc_AesFree(&aes);
-      return 0;
-    }
-    wc_AesFree(&aes);
-
-    return main_encrypt_size + tail_encrypt_size;
-  }
-
-  std::size_t decrypt(const in_slice_t& in,
-		      const out_slice_t& out) const override {
-    if (in.length % AES_BLOCK_LEN != 0 || in.length < AES_BLOCK_LEN) {
-      throw std::runtime_error("input not aligned to AES_BLOCK_LEN");
-    } else if (out.buf == nullptr) {
-      // essentially it would be possible to decrypt into a buffer that
-      // doesn't include space for any PKCS#7 padding. We don't do that
-      // for the sake of performance and simplicity.
-      return in.length;
-    } else if (out.max_length < in.length) {
-      throw std::runtime_error("output buffer too small");
-    }
-
-    Aes aes;
-    if (cephx_wc_aes_init(&aes, AES_DECRYPTION,
-			  (const unsigned char*)secret.c_str()) != 0) {
-      throw std::runtime_error("wolfCrypt AES init failed");
-    }
-    if (wc_AesCbcDecrypt(&aes, out.buf, in.buf, in.length) != 0) {
-      wc_AesFree(&aes);
-      throw std::runtime_error("wolfCrypt AES-CBC decrypt failed");
-    }
-    wc_AesFree(&aes);
-
-    // NOTE: we aren't handling partial decrypt. PKCS#7 padding must be
-    // at the end. If it's malformed, don't say a word to avoid risk of
-    // having an oracle. All we need to ensure is valid buffer boundary.
-    const auto pad_len = \
-      std::min<std::uint8_t>(out.buf[in.length - 1], AES_BLOCK_LEN);
-    return in.length - pad_len;
-  }
-};
-
-#endif // WITH_WOLFCRYPT_CEPHX
 
 
 // ------------------------------------------------------------
@@ -839,6 +712,3 @@ CryptoHandler *CryptoHandler::create(int type)
     return NULL;
   }
 }
-
-#pragma clang diagnostic pop
-#pragma GCC diagnostic pop

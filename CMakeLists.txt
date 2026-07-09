@@ -498,23 +498,6 @@ endif()
 find_package(OpenSSL REQUIRED)
 set(CRYPTO_LIBS OpenSSL::Crypto)
 
-# Optionally route cephx AES-128-CBC (src/auth/Crypto.cc) through wolfCrypt
-# directly, so cephx key/ticket crypto executes inside the wolfCrypt FIPS
-# module rather than OpenSSL's low-level AES. OFF => stock behavior unchanged.
-option(WITH_WOLFCRYPT_CEPHX "Route cephx AES-128-CBC through wolfCrypt directly" OFF)
-if(WITH_WOLFCRYPT_CEPHX)
-  find_package(PkgConfig REQUIRED)
-  # IMPORTED_TARGET yields PkgConfig::WOLFSSL carrying include dirs AND the link
-  # directory + lib, so linking works when wolfSSL is at a non-default prefix
-  # (e.g. a commercial FIPS bundle in /usr/local or /opt) -- a bare -lwolfssl
-  # with no -L would fail there.
-  pkg_check_modules(WOLFSSL REQUIRED IMPORTED_TARGET wolfssl)
-  # Global so EVERY target that compiles src/auth/Crypto.cc gets the wolfCrypt
-  # branch -- including crimson-common and crimson, which also compile it.
-  add_compile_definitions(WITH_WOLFCRYPT_CEPHX)
-  message(STATUS "cephx: wolfCrypt-direct backend enabled (wolfssl ${WOLFSSL_VERSION})")
-endif()
-
 option(WITH_DPDK "Enable DPDK messaging" OFF)
 if(WITH_DPDK)
   find_package(dpdk)

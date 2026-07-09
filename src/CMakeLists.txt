@@ -573,13 +573,6 @@ add_library(common STATIC ${ceph_common_objs})
 target_link_libraries(common
   ${ceph_common_deps}
   legacy-option-headers)
-if(WITH_WOLFCRYPT_CEPHX)
-  # Static sibling of ceph-common: its auth objects reference wolfCrypt. Plain
-  # signature (matching the call above) populates INTERFACE_LINK_LIBRARIES, so
-  # every executable linking libcommon.a (many, built with -Wl,--no-undefined)
-  # also pulls -lwolfssl.
-  target_link_libraries(common PkgConfig::WOLFSSL)
-endif()
 if(WITH_JAEGER)
 add_dependencies(common jaeger_base)
 endif()
@@ -598,14 +591,6 @@ if(ENABLE_COVERAGE)
 endif(ENABLE_COVERAGE)
 
 target_link_libraries(ceph-common legacy-option-headers)
-
-if(WITH_WOLFCRYPT_CEPHX)
-  # common-auth-objs (which carries the wolfCrypt cephx backend) is aggregated
-  # into ceph-common via $<TARGET_OBJECTS:>, which does NOT propagate an object
-  # library's link requirements. Link wolfSSL onto the shared library directly
-  # so libceph-common.so gets libwolfssl as a NEEDED and wc_Aes* resolve.
-  target_link_libraries(ceph-common PkgConfig::WOLFSSL)
-endif()
 
 if(WITH_JAEGER)
 add_dependencies(ceph-common jaeger_base)

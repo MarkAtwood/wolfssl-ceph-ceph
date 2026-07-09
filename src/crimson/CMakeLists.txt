@@ -149,11 +149,6 @@ target_link_libraries(crimson-common
     crc32 arch
     ${crimson_common_deps}
     OpenSSL::Crypto)
-if(WITH_WOLFCRYPT_CEPHX)
-  # crimson-common also compiles src/auth/Crypto.cc; the global define selects
-  # its wolfCrypt branch, so it needs wolfSSL linked too (else undefined wc_Aes*).
-  target_link_libraries(crimson-common PRIVATE PkgConfig::WOLFSSL)
-endif()
 
 set(crimson_auth_srcs
   auth/KeyRing.cc
@@ -200,11 +195,6 @@ target_link_libraries(crimson
   PUBLIC
     crimson-common
     crimson::cflags)
-if(WITH_WOLFCRYPT_CEPHX)
-  # crimson compiles src/auth/Crypto.cc directly (crimson_auth_srcs); wolfSSL is
-  # a PRIVATE dep of crimson-common so it does not propagate -- link it here too.
-  target_link_libraries(crimson PRIVATE PkgConfig::WOLFSSL)
-endif()
 add_subdirectory(admin)
 add_subdirectory(os)
 add_subdirectory(osd)
