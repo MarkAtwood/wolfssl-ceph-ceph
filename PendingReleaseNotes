@@ -60,6 +60,13 @@
     Configuration file syntax follows the OpenSSL standard (see https://github.com/openssl/openssl/blob/master/doc/man5/config.pod).
     If the default provider is required when also using custom providers,
     it must be explicitly loaded in the configuration file or code (see https://github.com/openssl/openssl/blob/master/README-PROVIDERS.md).
+  - Added the `openssl_provider_opts` configuration option for loading OpenSSL 3
+    providers inline, without an external OpenSSL configuration file:
+    colon-separated provider stanzas of comma-separated key=value pairs. Each
+    stanza must include `identity=<provider-name>`; out-of-tree providers (e.g.
+    KAE) additionally pass `module=/path/to/provider.so`. Every listed provider
+    is activated; an `activate=` key in the option value is ignored with a
+    logged warning.
 * RGW: Fixed bucket notification events so the 'x_amz_request_id' in NotificationEvent now matches the 'x_amz_request_id' returned by the corresponding S3 operation.
 * RGW: The rgw_gc_max_deferred and rgw_gc_max_deferred_entries_size options have been removed, as they did not do anything.
   - Updated the default for rgw_gc_max_queue_size to account for the extra space from removing rgw_gc_max_deferred_entries_size.

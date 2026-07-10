@@ -830,6 +830,24 @@ options:
   level: advanced
   desc: Use openssl_conf for specific openssl algorithm
   long_desc: 'Pass opts in this way: openssl_conf=/path/to/openssl.conf'
+  see_also:
+  - openssl_provider_opts
+  flags:
+  - startup
+- name: openssl_provider_opts
+  type: str
+  level: advanced
+  desc: Load OpenSSL 3 providers at radosgw startup
+  long_desc: 'Colon-separated provider stanzas of comma-separated key=value
+    pairs forming an OpenSSL provider config section. Each stanza must include
+    identity=<provider-name>; use module=/path/to/provider.so for out-of-tree
+    providers. Activation is automatic: every listed provider is activated,
+    and an activate key in the option value is ignored with a logged warning.
+    Unlike openssl_conf, no external OpenSSL config file is needed.
+    Requires a build against OpenSSL >= 3.0.
+    Example: identity=kae,module=/usr/lib64/kae_provider.so'
+  see_also:
+  - openssl_conf
   flags:
   - startup
 - name: mempool_debug
