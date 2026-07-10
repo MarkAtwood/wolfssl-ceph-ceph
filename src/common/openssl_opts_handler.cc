@@ -16,6 +16,7 @@
 #include "openssl_opts_handler.h"
 
 #include <openssl/bio.h>
+#include <openssl/err.h>
 #include <openssl/conf.h>
 
 #include "common/debug.h"
@@ -46,6 +47,7 @@ static string get_openssl_error()
   if (bio == nullptr) {
     return "failed to create BIO for more error printing";
   }
+  ERR_print_errors(bio);
   char* buf;
   size_t len = BIO_get_mem_data(bio, &buf);
   string ret(buf, len);
